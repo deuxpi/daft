@@ -2,7 +2,6 @@ import asyncio
 import collections
 import logging
 import random
-import time
 import uuid
 
 
@@ -14,8 +13,8 @@ class Server:
 
         self._id = uuid.uuid4()
         self._followers = {}
-        self._election_timeout = random.uniform(0.150, 0.300)
         self._log = ReplicatedLog(self)
+        self._election_timeout = random.uniform(0.150, 0.300)
 
         self._wait_for_append_entries = None
 
@@ -28,12 +27,14 @@ class Server:
         if self._wait_for_append_entries is not None:
             raise RuntimeError('start_follower called while already waiting for AppendEntries RPC')
 
-        self._wait_for_append_entries = asyncio.Future()
-        while True:
-            try:
+        try:
+            while True:
+                self._wait_for_append_entries = asyncio.Future()
                 await asyncio.wait_for(self._wait_for_append_entries, self._election_timeout)
-            except asyncio.TimeoutError:
-                await self._convert_to_candidate()
+        except asyncio.TimeoutError:
+            await self._convert_to_candidate()
+        finally:
+            self._wait_for_append_entries = None
 
     async def start_leader(self):
         while True:
@@ -52,9 +53,9 @@ class Server:
     def handle_append_entries(self, leader_term, leader_id, prev_log_index, prev_log_term, entries, leader_commit_index):
         self._check_if_behind(leader_term)
         if leader_term < self.current_term:
-            log.debug("Received AppendEntries RPC from old leader.")
+            self._logger.debug("Received AppendEntries RPC from old leader.")
             return (self.current_term, False)
-        if self._log[pref_log_index].term != prev_log_term:
+        if self._log[prev_log_index].term != prev_log_term:
             return (self.current_term, False)
         index = prev_log_index
         for entry in entries:
@@ -130,7 +131,6 @@ class Server:
                     else:
                         next_index -= 1
 
-
     def process_command(self, command):
         raise NotImplementedError('Server subclasses should implement process_command')
 
@@ -200,7 +200,7 @@ def main():
         server = LoggingServer()
         asyncio.ensure_future(server.run(loop))
     loop.run_forever()
-    loop.close()
+
 
 if __name__ == '__main__':
     main()
