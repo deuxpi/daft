@@ -6,18 +6,18 @@ import time
 import uuid
 
 
-logger = logging.getLogger(__name__)
-
-
 class Server:
     def __init__(self):
         self.current_term = 0
         self.voted_for = None
         self.state = 'follower'
+
         self._id = uuid.uuid4()
         self._followers = {}
         self._election_timeout = random.uniform(0.150, 0.300)
         self._log = ReplicatedLog(self)
+
+        self._logger = logging.getLogger(str(self._id))
 
     async def run(self, loop=None):
         self._wait_for_append_entries = asyncio.Future()
@@ -29,7 +29,7 @@ class Server:
 
     def receive_command(self, command):
         if self.state != 'leader':
-            logger.error("Received command without being leader.")
+            self._logger.error("Received command without being leader.")
             raise WhatAreYouExpectingError()
         self._log.append_entry(Entry(self.current_term, command))
 
@@ -43,14 +43,14 @@ class Server:
         index = prev_log_index
         for entry in entries:
             if entry is Heartbeat:
-                logger.debug("Received heartbeat.")
+                self._logger.debug("Received heartbeat.")
                 continue
             index += 1
             existing_entry = self._log[index]
             if existing_entry is not None:
                 if existing_entry.term == entry.term:
                     continue
-                logger.warning("Found log inconsistency. Overwriting conflicting entries.")
+                self._logger.warning("Found log inconsistency. Overwriting conflicting entries.")
                 self._log.clear_from(index)
             self._log.append_entry(entry)
         self._log.update_commit_index(leader_commit_index)
@@ -70,27 +70,33 @@ class Server:
             self.current_term = term
             self.state = 'follower'
         if self.state == 'leader':
-            logger.error("Received RPC while being leader.")
+            self._logger.error("Received RPC while being leader.")
             raise DoNotTellMeWhatToDoError()
 
     async def _convert_to_candidate(self):
-        self._start_election()
-        self._send_request_vote()
-        if True:  # yolo
-            logger.info("Obtained majority of votes. Converting to leader.")
-            await self._become_leader()
-        else:
-            logger.info("Received AppendEntries RPC from new leader. Converting to follower.")
-            self.state = 'follower'
-        # Timeout: start new election
+        while True:
+            self._start_election()
+            try:
+                votes = await asyncio.wait_for(self._send_request_vote(), self._election_timeout)
+                if votes >= 3:
+                    self._logger.info("Obtained majority of votes. Converting to leader.")
+                    await self._become_leader()
+                else:
+                    self._logger.info("Received AppendEntries RPC from new leader. Converting to follower.")
+                    self.state = 'follower'
+                break
+            except asyncio.TimeoutError:
+                self._logger.info("Election timeout: starting new election")
 
     def _start_election(self):
         self.current_term += 1
         self.voted_for = None
         self._election_timeout = random.uniform(0.150, 0.300)
+        self._logger.info("Starting election %d (waiting for %.3f)", self.current_term, self._election_timeout)
 
-    def _send_request_vote(self):
-        pass
+    async def _send_request_vote(self):
+        await asyncio.sleep(random.uniform(0.0, 0.25))
+        return random.randrange(5)
 
     async def _become_leader(self):
         self.state = 'leader'
@@ -173,12 +179,15 @@ class ReplicatedLog:
 
 class LoggingServer(Server):
     def process_command(self, command):
-        logger.info("Received: {}".format(command))
+        self._logger.info("Received: {}".format(command))
 
 
 def main():
     import coloredlogs
-    coloredlogs.install(level='DEBUG', milliseconds=True)
+    coloredlogs.install(
+        level='DEBUG',
+        fmt='%(asctime)s,%(msecs)03d %(name)s %(levelname)s %(message)s',
+        milliseconds=True)
 
     loop = asyncio.get_event_loop()
 
