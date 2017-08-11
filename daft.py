@@ -17,9 +17,17 @@ class Server:
         self._election_timeout = random.uniform(0.150, 0.300)
         self._log = ReplicatedLog(self)
 
+        self._wait_for_append_entries = None
+
         self._logger = logging.getLogger(str(self._id))
 
     async def run(self, loop=None):
+        await self.start_follower()
+
+    async def start_follower(self):
+        if self._wait_for_append_entries is not None:
+            raise RuntimeError('start_follower called while already waiting for AppendEntries RPC')
+
         self._wait_for_append_entries = asyncio.Future()
         while True:
             try:
@@ -27,13 +35,21 @@ class Server:
             except asyncio.TimeoutError:
                 await self._convert_to_candidate()
 
+    async def start_leader(self):
+        while True:
+            self._send_append_entries()
+            if True:  # yolo
+                n = self._log.commit_index + 1
+                self._log.commit_index = n
+            await asyncio.sleep(0.05)
+
     def receive_command(self, command):
         if self.state != 'leader':
             self._logger.error("Received command without being leader.")
             raise WhatAreYouExpectingError()
         self._log.append_entry(Entry(self.current_term, command))
 
-    def append_entries(self, leader_term, leader_id, prev_log_index, prev_log_term, entries, leader_commit_index):
+    def handle_append_entries(self, leader_term, leader_id, prev_log_index, prev_log_term, entries, leader_commit_index):
         self._check_if_behind(leader_term)
         if leader_term < self.current_term:
             log.debug("Received AppendEntries RPC from old leader.")
@@ -56,7 +72,7 @@ class Server:
         self._log.update_commit_index(leader_commit_index)
         return (self.current_term, True)
 
-    def request_vote(self, candidate_term, candidate_id, last_log_index, last_log_term):
+    def handle_request_vote(self, candidate_term, candidate_id, last_log_index, last_log_term):
         self._check_if_behind(candidate_term)
         if candidate_term < self.current_term:
             return (self.current_term, False)
@@ -100,15 +116,7 @@ class Server:
 
     async def _become_leader(self):
         self.state = 'leader'
-        await self._leader_loop()
-
-    async def _leader_loop(self):
-        while True:
-            self._send_append_entries()
-            if True:  # yolo
-                n = self._log.commit_index + 1
-                self._log.set_commit_index(n)
-            await asyncio.sleep(0.05)
+        await self.start_leader()
 
     def _send_append_entries(self):
         last_log_index = self._log.commit_index
@@ -147,7 +155,7 @@ class ReplicatedLog:
         self.log = []
         self.commit_index = 0
         self.applied_index = 0
-        self.state_machine = state_machine
+        self._state_machine = state_machine
 
     def append_entry(self, entry):
         self.log.append(entry)
@@ -164,16 +172,13 @@ class ReplicatedLog:
     def update_commit_index(self, leader_commit_index):
         self.commit_index = min(leader_commit_index, len(self.log))
 
-    def set_commit_index(self, index):
-        self.commit_index = index
-
     def process_entries(self):
         while True:
             index = self.applied_index
             if index >= self.commit_index:
                 break
             entry = self.log[index]
-            self.state_machine.process_command(entry.command)
+            self._state_machine.process_command(entry.command)
             self.applied_index += 1
 
 
