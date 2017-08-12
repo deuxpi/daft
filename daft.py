@@ -1,5 +1,6 @@
 import asyncio
 import collections
+import json
 import logging
 import pathlib
 import random
@@ -9,27 +10,35 @@ import aiohttp.web
 
 
 class Server:
-    def __init__(self):
+    def __init__(self, loop, host='127.0.0.1'):
+        self._loop = loop
+        self.waiter = loop.create_future()
+
+        self.id = uuid.uuid4()
+        self.address = None
+
         self.current_term = 0
         self.voted_for = None
         self.state = 'follower'
 
-        self._id = uuid.uuid4()
+        self._host = host
         self._followers = {}
         self._log = ReplicatedLog(self)
         self._election_timeout = random.uniform(0.150, 0.300)
 
         self._wait_for_append_entries = None
 
-        self._logger = logging.getLogger(str(self._id))
+        self._logger = logging.getLogger(str(self.id))
 
         self._http_server = aiohttp.web.Server(self.http_handler)
 
-    async def run(self, loop=None):
-        if loop is None:
-            loop = asyncio.get_event_loop()
-        server = await loop.create_server(self._http_server, '127.0.0.1', random.randrange(8080, 8180))
-        self._logger.info("Serving on http://%s:%d", *server.sockets[0].getsockname())
+    async def run(self):
+        server = await self._loop.create_server(self._http_server, self._host, 0)
+        self.address = server.sockets[0].getsockname()
+        self._logger.info("Serving on http://%s:%d", *self.address)
+        if not self.waiter.done():
+            self.waiter.set_result(self)
+
         try:
             while True:
                 if self.state == 'follower':
@@ -74,7 +83,7 @@ class Server:
 
     async def start_leader(self):
         while True:
-            self._send_append_entries()
+            await self._send_append_entries()
             if True:  # yolo
                 n = self._log.commit_index + 1
                 self._log.commit_index = n
@@ -83,13 +92,13 @@ class Server:
     async def http_handler(self, request):
         path = pathlib.PurePosixPath(request.path)
         if len(path.parts) != 2:
-            return aiohttp.web.Response(status=404)
+            return aiohttp.web.Response(status=404, text='Not Found')
         dispatch = path.parts[1]
 
         try:
             meth = getattr(self, 'handle_{}'.format(dispatch))
         except AttributeError:
-            return aiohttp.web.Response(status=404)
+            return aiohttp.web.Response(status=404, text='Not Found')
         json_body = await request.json()
         status = meth(**json_body)
         return aiohttp.web.json_response({'term': self.current_term, 'status': status})
@@ -99,6 +108,10 @@ class Server:
             self._logger.error("Received command without being leader.")
             raise WhatAreYouExpectingError()
         self._log.append_entry(Entry(self.current_term, command))
+
+    def handle_register_server(self, **kwargs):
+        self._followers[(kwargs['host'], kwargs['port'])] = 0
+        return True
 
     def handle_append_entries(self, **kwargs):
         leader_term = int(kwargs['term'])
@@ -110,9 +123,9 @@ class Server:
         self._check_if_behind(leader_term)
         if leader_term < self.current_term:
             self._logger.debug("Received AppendEntries RPC from old leader.")
-            return self._response(False)
+            return False
         if self._log[prev_log_index].term != prev_log_term:
-            return self._response(False)
+            return False
         index = prev_log_index
         if not entries:
             self._logger.debug("Received heartbeat.")
@@ -127,16 +140,16 @@ class Server:
                     self._log.clear_from(index)
                 self._log.append_entry(entry)
         self._log.update_commit_index(leader_commit_index)
-        return self._response(True)
+        return True
 
     def handle_request_vote(self, candidate_term, candidate_id, last_log_index, last_log_term):
         self._check_if_behind(candidate_term)
         if candidate_term < self.current_term:
-            return self._response(False)
+            return False
         if self.voted_for is None or self.voted_for == candidate_id:
             if last_log_index >= self._log.commit_index:
                 return (self.current_term, True)
-        return self._response(False)
+        return False
 
     def _check_if_behind(self, term):
         if term > self.current_term:
@@ -156,12 +169,29 @@ class Server:
         await asyncio.sleep(random.uniform(0.0, 0.25))
         return random.randrange(5)
 
-    def _send_append_entries(self):
+    async def _send_append_entries(self):
         last_log_index = self._log.commit_index
         for follower, next_index in self._followers.items():
             if last_log_index >= next_index:
                 while True:
-                    term, success = follower.append_entries(self.current_term, self._id, and_so_on)
+                    host, port = follower
+                    async with aiohttp.ClientSession(loop=self._loop) as session:
+                        args = {
+                            'term': self.current_term,
+                            'prevLogIndex': max(0, next_index - 1),
+                            'prevLogTerm': self.current_term,  # self._log[next_index - 1],
+                            'entries': [{'term': e.term, 'command': e.command} for e in self._log[next_index:]],
+                            'leaderCommitIndex': self._log.commit_index,
+                        }
+                        url = 'http://{}:{}/append_entries'.format(host, port)
+                        async with session.post(url, json=args) as response:
+                            json_body = await response.json()
+                            if response.status == 200:
+                                # term = json_body['term']
+                                success = json_body['success']
+                            else:
+                                self._logger.error('%d: %s', response.status, await response.text())
+                                success = False
                     if success:
                         self._followers[follower] = last_log_index
                         break
@@ -175,12 +205,16 @@ class Server:
 Entry = collections.namedtuple('Entry', ['term', 'command'])
 
 
-class DoNotTellMeWhatToDoError(Exception):
-    pass
+class DoNotTellMeWhatToDoError(aiohttp.web.HTTPConflict):
+    def __init__(self):
+        body = json.dumps({'error': self.__class__.__name__}).encode('utf-8')
+        aiohttp.web.HTTPConflict.__init__(self, body=body, headers={'Content-Type': 'application/json'})
 
 
-class WhatAreYouExpectingError(Exception):
-    pass
+class WhatAreYouExpectingError(aiohttp.web.HTTPBadRequest):
+    def __init__(self):
+        body = json.dumps({'error': self.__class__.__name__}).encode('utf-8')
+        aiohttp.web.HTTPBadRequest.__init__(self, body=body, headers={'Content-Type': 'application/json'})
 
 
 class ReplicatedLog:
@@ -220,6 +254,28 @@ class LoggingServer(Server):
         self._logger.info("Received: {}".format(command))
 
 
+class Orchestrator:
+    def __init__(self, loop):
+        self.servers = {}
+        self._loop = loop
+        self._logger = logging.getLogger(self.__class__.__name__)
+
+    def server_ready(self, waiter):
+        new_server = waiter.result()
+        self._logger.info("New server at %s", new_server.address)
+        for server in self.servers.values():
+            self._loop.create_task(self.register_server(server, new_server))
+            self._loop.create_task(self.register_server(new_server, server))
+        self.servers[new_server.id] = new_server
+
+    async def register_server(self, server, new_server):
+        host, port = new_server.address
+        req = {'host': host, 'port': port}
+        async with aiohttp.ClientSession(loop=self._loop) as session:
+            async with session.post('http://{}:{}/register_server'.format(host, port), json=req) as response:
+                self._logger.debug('[%s] %d: %s', server.id, response.status, await response.text())
+
+
 def main():
     try:
         import coloredlogs
@@ -231,10 +287,13 @@ def main():
         pass
 
     loop = asyncio.get_event_loop()
+    o = Orchestrator(loop)
 
     for i in range(5):
-        server = LoggingServer()
-        asyncio.ensure_future(server.run(loop))
+        server = LoggingServer(loop)
+        server.waiter.add_done_callback(o.server_ready)
+        asyncio.ensure_future(server.run())
+
     loop.run_forever()
 
 
